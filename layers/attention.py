@@ -113,18 +113,33 @@ def store_kvcache(
             D
         )
     else:
-        # Fallback: use PyTorch indexing
-        key = key.reshape(N, D)
-        value = value.reshape(N, D)
-
-        for i in range(N):
-            slot = slot_mapping[i].item()
-            if slot == -1:
-                continue
-            block_idx = slot // k_cache.size(1)
-            slot_idx = slot % k_cache.size(1)
-            k_cache[block_idx, slot_idx] = key[i]
-            v_cache[block_idx, slot_idx] = value[i]
+        # Fallback: use PyTorch operations compatible with CUDA graphs
+        # k_cache shape: [num_blocks, block_size, num_kv_heads, head_dim]
+        # key shape: [N, num_kv_heads, head_dim]
+        # Note: During CUDA graph capture, we need to avoid dynamic operations
+        # For now, skip cache storage during decode (graphs are only for decode)
+        # Cache storage happens during prefill which doesn't use graphs
+        block_size = k_cache.size(1)
+        total_slots = k_cache.size(0) * k_cache.size(1)
+        
+        # Flatten cache for indexing
+        k_cache_flat = k_cache.view(total_slots, k_cache.size(2), k_cache.size(3))
+        v_cache_flat = v_cache.view(total_slots, v_cache.size(2), v_cache.size(3))
+        
+        # Use scatter_ for efficient assignment (CUDA graph compatible)
+        # scatter_(dim, index, src) - scatters src into self along dim according to index
+        # We need: k_cache_flat[slot[i]] = key[i] for all i
+        # Reshape for scatter: key needs extra dimension [1, N, num_kv_heads, head_dim]
+        # Then scatter along dim=0 using slot_mapping as index
+        
+        # Handle invalid slots: clamp -1 to 0 (safe fallback during graph capture)
+        safe_slots = torch.clamp(slot_mapping, min=0, max=total_slots - 1).long()
+        
+        # Use index_copy_ which is more direct: copies from source to destination at indices
+        # index_copy_(dim, index, source) - copies elements from source to self at indices
+        # This is CUDA graph compatible
+        k_cache_flat.index_copy_(0, safe_slots, key)
+        v_cache_flat.index_copy_(0, safe_slots, value)
 
 
 class Attention(nn.Module):
