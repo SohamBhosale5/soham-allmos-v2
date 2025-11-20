@@ -27,12 +27,14 @@ class Scheduler(ABC):
         pass
 
     @abstractmethod
-    def schedule(self) -> Tuple[List, bool]:
+    def schedule(self) -> Tuple[List, List]:
         """
         Schedule sequences for the next step.
 
         Returns:
-            Tuple of (sequences_to_run, is_prefill)
+            Tuple of (prefill_sequences, decode_sequences)
+            - prefill_sequences: New sequences to process (first token)
+            - decode_sequences: Running sequences to continue (next token)
         """
         pass
 

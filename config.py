@@ -22,6 +22,12 @@ class Config:
     # Batching configuration
     max_num_seqs: int = 512
     max_num_batched_tokens: int = 16384
+    
+    # Prefill/decode interleaving configuration
+    enable_prefill_decode_interleaving: bool = True
+    prefill_token_budget_ratio: float = 0.3  # Fraction of token budget for prefill
+    min_prefill_batch_size: int = 1  # Minimum prefill sequences to schedule
+    min_decode_batch_size: int = 1  # Minimum decode sequences to schedule
 
     # Memory configuration
     gpu_memory_utilization: float = 0.9
@@ -58,6 +64,14 @@ class Config:
         # Ensure max_num_batched_tokens >= max_model_len
         assert self.max_num_batched_tokens >= self.max_model_len, \
             "max_num_batched_tokens must be >= max_model_len"
+        
+        # Validate interleaving parameters
+        assert 0.0 < self.prefill_token_budget_ratio < 1.0, \
+            "prefill_token_budget_ratio must be between 0 and 1"
+        assert self.min_prefill_batch_size >= 0, \
+            "min_prefill_batch_size must be >= 0"
+        assert self.min_decode_batch_size >= 0, \
+            "min_decode_batch_size must be >= 0"
 
     def compute_num_kvcache_blocks(self, total_memory: int, used_memory: int,
                                    peak_memory: int, current_memory: int) -> int:

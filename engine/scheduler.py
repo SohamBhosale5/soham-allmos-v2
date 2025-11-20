@@ -51,6 +51,12 @@ class Scheduler(SchedulerABC):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos_token_id = config.eos_token_id
+        
+        # Interleaving configuration
+        self.enable_interleaving = config.enable_prefill_decode_interleaving
+        self.prefill_token_budget_ratio = config.prefill_token_budget_ratio
+        self.min_prefill_batch_size = config.min_prefill_batch_size
+        self.min_decode_batch_size = config.min_decode_batch_size
 
         # Block manager for KV cache memory
         self.block_manager = BlockManager(
@@ -80,82 +86,133 @@ class Scheduler(SchedulerABC):
         """
         self.waiting.append(seq)
 
-    def schedule(self) -> Tuple[List[Sequence], bool]:
+    def schedule(self) -> Tuple[List[Sequence], List[Sequence]]:
         """
-        Schedule sequences for the next execution step.
+        Schedule sequences for the next execution step with prefill/decode interleaving.
 
         Strategy:
-        1. Prefill phase: Schedule waiting sequences (first token generation)
-           - Try to schedule as many as fit within token/memory budgets
-           - Each sequence processes all prompt tokens at once
-
-        2. Decode phase: Schedule running sequences (subsequent tokens)
-           - Each sequence generates one token
-           - Handle preemption if memory is insufficient
+        1. If interleaving enabled: Schedule both prefill and decode in same step
+           - Allocate token budget between prefill (30%) and decode (70%)
+           - Schedule prefill sequences up to budget
+           - Schedule decode sequences with remaining capacity
+           
+        2. If interleaving disabled: Use original behavior
+           - Prioritize prefill, then decode
 
         Returns:
-            Tuple of (sequences_to_run, is_prefill)
+            Tuple of (prefill_sequences, decode_sequences)
         """
-        # Try prefill phase first (prioritize new sequences)
-        scheduled_seqs = []
-        num_seqs = 0
-        num_batched_tokens = 0
+        prefill_seqs = []
+        decode_seqs = []
+        
+        if not self.enable_interleaving:
+            # Original behavior: schedule prefill OR decode
+            scheduled_seqs = []
+            num_seqs = 0
+            num_batched_tokens = 0
 
-        while self.waiting and num_seqs < self.max_num_seqs:
+            # Try prefill phase first
+            while self.waiting and num_seqs < self.max_num_seqs:
+                seq = self.waiting[0]
+                tokens_needed = len(seq) - seq.num_cached_tokens
+
+                if (num_batched_tokens + tokens_needed > self.max_num_batched_tokens or
+                    not self.block_manager.can_allocate(seq)):
+                    break
+
+                num_seqs += 1
+                self.block_manager.allocate(seq)
+                num_batched_tokens += tokens_needed
+                seq.status = SequenceStatus.RUNNING
+                self.waiting.popleft()
+                self.running.append(seq)
+                scheduled_seqs.append(seq)
+
+            if scheduled_seqs:
+                return scheduled_seqs, []
+
+            # Decode phase
+            while self.running and num_seqs < self.max_num_seqs:
+                seq = self.running.popleft()
+                while not self.block_manager.can_append(seq):
+                    if self.running:
+                        victim = self.running.pop()
+                        self.preempt(victim)
+                    else:
+                        self.preempt(seq)
+                        break
+                else:
+                    num_seqs += 1
+                    self.block_manager.may_append(seq)
+                    scheduled_seqs.append(seq)
+
+            assert scheduled_seqs, "No sequences could be scheduled!"
+            self.running.extendleft(reversed(scheduled_seqs))
+            return [], scheduled_seqs
+
+        # Interleaving enabled: schedule both prefill and decode
+        prefill_token_budget = int(self.max_num_batched_tokens * self.prefill_token_budget_ratio)
+        prefill_tokens_used = 0
+        prefill_count = 0
+        
+        # Schedule prefill sequences (up to budget)
+        while self.waiting and prefill_count < self.max_num_seqs:
             seq = self.waiting[0]
-
-            # Check constraints:
-            # 1. Token budget: Don't exceed max_num_batched_tokens
-            # 2. Memory budget: Check if we can allocate blocks
             tokens_needed = len(seq) - seq.num_cached_tokens
 
-            if (num_batched_tokens + tokens_needed > self.max_num_batched_tokens or
+            # Check if we exceed prefill budget or total capacity
+            if (prefill_tokens_used + tokens_needed > prefill_token_budget or
+                prefill_count >= self.max_num_seqs or
                 not self.block_manager.can_allocate(seq)):
-                # Can't schedule this sequence, stop trying
                 break
 
-            # Schedule the sequence
-            num_seqs += 1
+            # Schedule the prefill sequence
             self.block_manager.allocate(seq)
-            num_batched_tokens += tokens_needed
+            prefill_tokens_used += tokens_needed
             seq.status = SequenceStatus.RUNNING
-
-            # Move from waiting to running
             self.waiting.popleft()
             self.running.append(seq)
-            scheduled_seqs.append(seq)
+            prefill_seqs.append(seq)
+            prefill_count += 1
 
-        # If we scheduled any prefill sequences, return them
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # Decode phase: Schedule running sequences
-        while self.running and num_seqs < self.max_num_seqs:
+        # Schedule decode sequences (remaining capacity)
+        decode_count = 0
+        max_decode_seqs = self.max_num_seqs - len(prefill_seqs)
+        
+        # Only schedule decode if we have minimum batch size or no prefill
+        decode_candidates = []
+        temp_running = deque()
+        
+        while self.running and decode_count < max_decode_seqs:
             seq = self.running.popleft()
-
-            # Check if we can append a token (may need new block)
+            
+            # Check if we can append a token
             while not self.block_manager.can_append(seq):
                 if self.running:
-                    # Preempt a sequence to free memory
                     victim = self.running.pop()
                     self.preempt(victim)
                 else:
-                    # No other sequences to preempt, preempt this one
                     self.preempt(seq)
                     break
             else:
-                # Successfully reserved space for append
-                num_seqs += 1
+                decode_candidates.append(seq)
+                decode_count += 1
+
+        # Only schedule decode if we meet minimum batch size or have no prefill
+        if len(decode_candidates) >= self.min_decode_batch_size or (not prefill_seqs and decode_candidates):
+            for seq in decode_candidates:
                 self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
+                decode_seqs.append(seq)
+            # Put decode sequences back at front of running queue
+            self.running.extendleft(reversed(decode_seqs))
+        else:
+            # Put candidates back if we didn't schedule them
+            self.running.extendleft(reversed(decode_candidates))
 
         # Must have at least one sequence to run
-        assert scheduled_seqs, "No sequences could be scheduled!"
+        assert prefill_seqs or decode_seqs, "No sequences could be scheduled!"
 
-        # Put scheduled sequences back at front of running queue
-        self.running.extendleft(reversed(scheduled_seqs))
-
-        return scheduled_seqs, False
+        return prefill_seqs, decode_seqs
 
     def preempt(self, seq: Sequence) -> None:
         """

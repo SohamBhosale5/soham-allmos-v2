@@ -127,11 +127,11 @@ class LLMEngine(LLMEngineABC):
 
     def step(self) -> Tuple[List, int]:
         """
-        Execute one step of generation.
+        Execute one step of generation with prefill/decode interleaving.
 
         Steps:
-        1. Scheduler decides which sequences to run
-        2. Model runner executes forward pass
+        1. Scheduler decides which sequences to run (prefill and/or decode)
+        2. Model runner executes forward pass(es)
         3. Scheduler postprocesses results
         4. Return completed sequences
 
@@ -140,26 +140,42 @@ class LLMEngine(LLMEngineABC):
             - completed_outputs: List of (seq_id, token_ids) for finished sequences
             - num_tokens_processed: Positive for prefill, negative for decode
         """
-        # Schedule sequences
-        seqs, is_prefill = self.scheduler.schedule()
+        # Schedule sequences (may return both prefill and decode)
+        prefill_seqs, decode_seqs = self.scheduler.schedule()
 
-        # Run model
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        all_outputs = []
+        total_tokens = 0
+        all_seqs = []
 
-        # Postprocess
-        self.scheduler.postprocess(seqs, token_ids)
+        # Run prefill if any sequences scheduled
+        if prefill_seqs:
+            prefill_token_ids = self.model_runner.call("run", prefill_seqs, True)
+            self.scheduler.postprocess(prefill_seqs, prefill_token_ids)
+            
+            # Collect finished sequences from prefill
+            for seq in prefill_seqs:
+                all_seqs.append(seq)
+                if seq.is_finished:
+                    all_outputs.append((seq.seq_id, seq.completion_token_ids))
+            
+            # Count prefill tokens (positive)
+            total_tokens += sum(len(seq) for seq in prefill_seqs)
 
-        # Collect finished sequences
-        outputs = [
-            (seq.seq_id, seq.completion_token_ids)
-            for seq in seqs
-            if seq.is_finished
-        ]
+        # Run decode if any sequences scheduled
+        if decode_seqs:
+            decode_token_ids = self.model_runner.call("run", decode_seqs, False)
+            self.scheduler.postprocess(decode_seqs, decode_token_ids)
+            
+            # Collect finished sequences from decode
+            for seq in decode_seqs:
+                all_seqs.append(seq)
+                if seq.is_finished:
+                    all_outputs.append((seq.seq_id, seq.completion_token_ids))
+            
+            # Count decode tokens (negative)
+            total_tokens -= len(decode_seqs)
 
-        # Count tokens (positive for prefill, negative for decode)
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-
-        return outputs, num_tokens
+        return all_outputs, total_tokens
 
     def is_finished(self) -> bool:
         """Check if all sequences are complete."""
