@@ -145,7 +145,6 @@ class LLMEngine(LLMEngineABC):
 
         all_outputs = []
         total_tokens = 0
-        all_seqs = []
 
         # Run prefill if any sequences scheduled
         if prefill_seqs:
@@ -154,7 +153,6 @@ class LLMEngine(LLMEngineABC):
             
             # Collect finished sequences from prefill
             for seq in prefill_seqs:
-                all_seqs.append(seq)
                 if seq.is_finished:
                     all_outputs.append((seq.seq_id, seq.completion_token_ids))
             
@@ -168,12 +166,15 @@ class LLMEngine(LLMEngineABC):
             
             # Collect finished sequences from decode
             for seq in decode_seqs:
-                all_seqs.append(seq)
                 if seq.is_finished:
                     all_outputs.append((seq.seq_id, seq.completion_token_ids))
             
             # Count decode tokens (negative)
             total_tokens -= len(decode_seqs)
+
+        # Must have at least one sequence to run
+        if not prefill_seqs and not decode_seqs:
+            raise RuntimeError("Scheduler returned empty batches for both prefill and decode")
 
         return all_outputs, total_tokens
 
