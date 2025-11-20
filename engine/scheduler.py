@@ -179,35 +179,29 @@ class Scheduler(SchedulerABC):
         decode_count = 0
         max_decode_seqs = self.max_num_seqs - len(prefill_seqs)
         
-        # Only schedule decode if we have minimum batch size or no prefill
-        decode_candidates = []
-        temp_running = deque()
-        
         while self.running and decode_count < max_decode_seqs:
             seq = self.running.popleft()
             
             # Check if we can append a token
             while not self.block_manager.can_append(seq):
                 if self.running:
+                    # Preempt a sequence to free memory
                     victim = self.running.pop()
                     self.preempt(victim)
                 else:
+                    # No other sequences to preempt, preempt this one
                     self.preempt(seq)
                     break
             else:
-                decode_candidates.append(seq)
-                decode_count += 1
-
-        # Only schedule decode if we meet minimum batch size or have no prefill
-        if len(decode_candidates) >= self.min_decode_batch_size or (not prefill_seqs and decode_candidates):
-            for seq in decode_candidates:
+                # Successfully reserved space for append
+                # Call may_append immediately to maintain state consistency
                 self.block_manager.may_append(seq)
                 decode_seqs.append(seq)
-            # Put decode sequences back at front of running queue
+                decode_count += 1
+
+        # Put scheduled decode sequences back at front of running queue
+        if decode_seqs:
             self.running.extendleft(reversed(decode_seqs))
-        else:
-            # Put candidates back if we didn't schedule them
-            self.running.extendleft(reversed(decode_candidates))
 
         # Must have at least one sequence to run
         assert prefill_seqs or decode_seqs, "No sequences could be scheduled!"
