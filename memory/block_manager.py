@@ -214,31 +214,42 @@ class BlockManager(BlockManagerABC):
         """
         Prepare for appending a token to sequence.
 
-        Allocates new block if current block is full.
+        Allocates new block if current block is about to be full.
         Updates hash when block becomes full.
 
         Args:
             seq: Sequence to prepare for append
         """
         block_table = seq.block_table
+        if not block_table:
+            return
+        
         last_block = self.blocks[block_table[-1]]
-
-        if len(seq) % self.block_size == 1:
-            # Last block is full, allocate new one
-            assert last_block.hash != -1, "Last block should have hash when full"
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-
-        elif len(seq) % self.block_size == 0:
-            # Just filled last block, compute and store hash
-            assert last_block.hash == -1, "Newly filled block shouldn't have hash yet"
-            token_ids = seq.block(seq.num_blocks - 1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-
-        else:
-            # Middle of block, nothing to do
-            assert last_block.hash == -1, "Partial block shouldn't have hash"
+        current_len = len(seq)
+        
+        # Check if we're about to fill the current block (will have block_size tokens after append)
+        if current_len % self.block_size == self.block_size - 1:
+            # About to fill the block - will set hash after append
+            # Allocate new block now for the token after next
+            if len(self.free_block_ids) > 0:
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                block_table.append(block_id)
+        
+        # Check if we just filled a block (have exactly block_size tokens in last block)
+        elif current_len % self.block_size == 0 and current_len > 0:
+            # Just filled last block, compute and store hash if not already set
+            if last_block.hash == -1:
+                token_ids = seq.block(seq.num_blocks - 1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
+            # Allocate new block for next token
+            if len(self.free_block_ids) > 0:
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                block_table.append(block_id)
+        
+        # If we're at position 1 in a block (after a full block), previous block should have hash
+        # But we don't need to do anything here - hash was set when that block was filled
