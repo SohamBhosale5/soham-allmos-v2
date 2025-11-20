@@ -482,6 +482,9 @@ class ModelRunner(ModelRunnerABC):
         Returns:
             List of sampled token IDs (None for worker ranks)
         """
+        # Reset context before preparing inputs to avoid contamination
+        reset_context()
+        
         # Prepare inputs
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
@@ -497,7 +500,7 @@ class ModelRunner(ModelRunnerABC):
         # Sample tokens (rank 0 only)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
 
-        # Reset context
+        # Reset context after run
         reset_context()
 
         return token_ids
