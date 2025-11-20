@@ -24,7 +24,7 @@ class Config:
     max_num_batched_tokens: int = 16384
     
     # Prefill/decode interleaving configuration
-    enable_prefill_decode_interleaving: bool = True
+    enable_prefill_decode_interleaving: bool = False  # Disabled by default until stable
     prefill_token_budget_ratio: float = 0.3  # Fraction of token budget for prefill
     min_prefill_batch_size: int = 1  # Minimum prefill sequences to schedule
     min_decode_batch_size: int = 1  # Minimum decode sequences to schedule
